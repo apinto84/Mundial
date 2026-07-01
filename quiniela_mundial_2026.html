@@ -249,6 +249,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         <div style="font-size:15px;font-weight:600;margin-bottom:.75rem">Base de datos</div>
         <div style="font-size:12px;color:#888780;margin-bottom:8px">Bin ID: <span id="bin-id-display" style="font-family:monospace"></span></div>
         <button class="btn" style="width:100%;margin-bottom:8px" onclick="syncNow()"><i class="ti ti-refresh"></i> Sincronizar ahora</button>
+        <button class="btn" style="width:100%;margin-bottom:8px" onclick="resetDevice()"><i class="ti ti-device-mobile"></i> Restablecer este dispositivo</button>
         <button class="btn btn-d" style="width:100%" onclick="disconnectBin()"><i class="ti ti-unlink"></i> Desconectar base de datos</button>
       </div>
       <div class="card" style="font-size:13px;color:#888780;line-height:1.8">
@@ -479,6 +480,75 @@ let state={players:[],preds:{},real:{},pts:{exact:5,winner:3},koTeams:{}};
 let local={activePlayer:null,ag:'A',rg:'A',myPlayers:[]};
 let saveTimer=null;
 let syncInterval=null;
+let pendingOps=[];
+
+function hasScoreValue(v){
+  return v!=='' && v!==null && v!==undefined && !Number.isNaN(v);
+}
+function normalizeScoreValue(v){
+  if(v==='' || v===null || v===undefined)return '';
+  const n=parseInt(v,10);
+  return Number.isNaN(n)?'':n;
+}
+function cleanRecord(remote){
+  return {
+    players:Array.isArray(remote&&remote.players)?remote.players:[],
+    preds:{...((remote&&remote.preds)||{})},
+    real:{...((remote&&remote.real)||{})},
+    pts:{...((remote&&remote.pts)||{exact:5,winner:3})},
+    koTeams:{...DEFAULT_KO_TEAMS,...((remote&&remote.koTeams)||{})}
+  };
+}
+function queueCloudOp(op){
+  pendingOps.push({...op,ts:Date.now()});
+  saveRemote();
+}
+function applyOp(target,op){
+  if(!target.players)target.players=[];
+  if(!target.preds)target.preds={};
+  if(!target.real)target.real={};
+  if(!target.pts)target.pts={exact:5,winner:3};
+  if(!target.koTeams)target.koTeams={...DEFAULT_KO_TEAMS};
+  if(op.type==='addPlayer'){
+    const name=(op.name||'').trim();
+    if(name && !target.players.includes(name))target.players.push(name);
+    if(name && !target.preds[name])target.preds[name]={};
+  }
+  if(op.type==='removePlayer' && cfg.isAdmin){
+    target.players=target.players.filter(p=>p!==op.name);
+    if(op.name)delete target.preds[op.name];
+  }
+  if(op.type==='pred'){
+    const pl=op.player, mid=op.matchId;
+    if(!pl||!mid)return;
+    if(!target.players.includes(pl))target.players.push(pl);
+    if(!target.preds[pl])target.preds[pl]={};
+    target.preds[pl][mid]={h:normalizeScoreValue(op.value&&op.value.h),a:normalizeScoreValue(op.value&&op.value.a)};
+  }
+  if(op.type==='real' && cfg.isAdmin){
+    const mid=op.matchId;
+    if(!mid)return;
+    target.real[mid]={h:normalizeScoreValue(op.value&&op.value.h),a:normalizeScoreValue(op.value&&op.value.a)};
+  }
+  if(op.type==='realBulk' && cfg.isAdmin){
+    Object.keys(op.real||{}).forEach(mid=>{
+      const v=op.real[mid];
+      target.real[mid]={h:normalizeScoreValue(v&&v.h),a:normalizeScoreValue(v&&v.a)};
+    });
+  }
+  if(op.type==='koTeam' && cfg.isAdmin){
+    const mid=op.matchId;
+    if(!mid)return;
+    if(!target.koTeams[mid])target.koTeams[mid]={t1:'Por definir',t2:'Por definir'};
+    target.koTeams[mid][op.side]=(op.value||'').trim()||'Por definir';
+  }
+  if(op.type==='koTeamsBulk' && cfg.isAdmin){
+    target.koTeams={...target.koTeams,...(op.koTeams||{})};
+  }
+  if(op.type==='pts' && cfg.isAdmin){
+    target.pts={exact:parseInt(op.pts&&op.pts.exact,10)||5,winner:parseInt(op.pts&&op.pts.winner,10)||3};
+  }
+}
 
 // ── Config local ──
 function loadCfg(){
@@ -555,6 +625,18 @@ async function connectExisting(){
 
 function disconnectBin(){toast('La base de datos está integrada en esta versión.');}
 
+function resetDevice(){
+  if(!confirm('Esto limpiará la vinculación local de este teléfono/navegador. No borra predicciones ni jugadores en la nube. ¿Continuar?'))return;
+  local={activePlayer:null,ag:'A',rg:'A',myPlayers:[]};
+  cfg.isAdmin=false;
+  saveCfg();
+  toast('✓ Dispositivo restablecido. Ahora selecciona tu nombre.');
+  syncNow();
+  renderPlayers();
+  renderPreds();
+  updateRoleBadge();
+}
+
 
 // ── Actualizar resultados desde API en vivo (TheSportsDB, gratis) ──
 async function fetchLiveResults(){
@@ -592,7 +674,7 @@ async function fetchLiveResults(){
       });
     });
     if(updated>0){
-      saveRemote();
+      queueCloudOp({type:'realBulk',real:state.real});
       toast(`✓ ${updated} resultado(s) actualizado(s)`);
       renderRealMatches();
       calcPoints();
@@ -610,82 +692,38 @@ async function fetchLiveResults(){
 async function syncNow(){
   setStatus('Sincronizando...');
   try{
-    const remote=await readBin();
-    if(!remote){setStatus('⚠ Sin datos remotos');return;}
-    const localPl=local.activePlayer;
-    const merged={...remote};
-    merged.players=remote.players||[];
-    merged.preds={...remote.preds};
-    merged.real={...remote.real};
-          // Merge koTeams: remoto primero, luego local (local gana)
-    const remoteKT=remote.koTeams||{};
-    const localKT=state.koTeams||{};
-    merged.koTeams={...DEFAULT_KO_TEAMS,...remoteKT,...localKT};
-    // Preservar TODAS las predicciones locales (no solo del jugador activo)
-    Object.keys(state.preds).forEach(p=>{
-      if(state.preds[p]&&Object.keys(state.preds[p]).length>0){
-        if(!merged.preds[p])merged.preds[p]={};
-        // Solo preservar predicciones locales NO vacias (evita borrar datos remotos buenos)
-        Object.keys(state.preds[p]).forEach(mid=>{
-          const lp=state.preds[p][mid];
-          // Preservar si ambos valores son números válidos (incluyendo 0) o strings no vacíos
-          const hOk = lp && (typeof lp.h==='number' || (lp.h!=='' && lp.h!==null && lp.h!==undefined));
-          const aOk = lp && (typeof lp.a==='number' || (lp.a!=='' && lp.a!==null && lp.a!==undefined));
-          if(hOk && aOk){
-            merged.preds[p][mid]=lp;
-          }
-        });
-      }
-    });
-    if(localPl){
-      if(!merged.players.includes(localPl))merged.players.push(localPl);
-      merged.activePlayer=localPl;
+    const remote=cleanRecord(await readBin());
+    // Al sincronizar solo se trae lo remoto. No se reescriben predicciones locales antiguas.
+    state={...remote};
+    if(local.activePlayer && !state.players.includes(local.activePlayer)){
+      local.activePlayer=null;
+      saveCfg();
     }
-    merged.pts=remote.pts||{exact:5,winner:3};
-    state=merged;
     setStatus('✓ Actualizado '+new Date().toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'}));
     refreshUI();
-  }catch(e){setStatus('⚠ Sin conexión');}
+  }catch(e){
+    setStatus('⚠ Sin conexión: '+(e&&e.message?e.message:'error'));
+  }
 }
 
 async function saveRemote(){
   clearTimeout(saveTimer);
   saveTimer=setTimeout(async()=>{
+    const ops=pendingOps.splice(0,pendingOps.length);
+    if(!ops.length)return;
     try{
-      let toSave={players:state.players,preds:state.preds,real:state.real,pts:state.pts};
-      try{
-        const remote=await readBin();
-        if(remote&&remote.players){
-          const merged={};
-          merged.players=[...new Set([...(remote.players||[]),...state.players])];
-          merged.preds={...remote.preds};
-          Object.keys(state.preds).forEach(p=>{
-            const remotePlayerPreds={...(remote.preds[p]||{})};
-            const localPlayerPreds=state.preds[p]||{};
-            // Solo aplicar predicciones locales que NO esten vacias
-            // Esto evita que campos vacios borren valores ya guardados en remoto
-            Object.keys(localPlayerPreds).forEach(mid=>{
-              const lp=localPlayerPreds[mid];
-              const hOk2 = lp && (typeof lp.h==='number' || (lp.h!=='' && lp.h!==null && lp.h!==undefined));
-              const aOk2 = lp && (typeof lp.a==='number' || (lp.a!=='' && lp.a!==null && lp.a!==undefined));
-              if(hOk2 && aOk2){
-                remotePlayerPreds[mid]=lp;
-              }
-            });
-            merged.preds[p]=remotePlayerPreds;
-          });
-          if(cfg.isAdmin){merged.real={...(remote.real||{}),...state.real};}
-          else{merged.real=remote.real||state.real;}
-          merged.pts=state.pts;
-          toSave=merged;
-          state={players:merged.players,preds:merged.preds,real:merged.real,pts:merged.pts};
-        }
-      }catch(e){}
-      await writeBin(toSave);
+      let remote={players:[],preds:{},real:{},pts:{exact:5,winner:3},koTeams:{...DEFAULT_KO_TEAMS}};
+      try{remote=cleanRecord(await readBin());}catch(e){}
+      ops.forEach(op=>applyOp(remote,op));
+      await writeBin(remote);
+      state=remote;
       saveCfg();
       setStatus('Guardado ✓ '+new Date().toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'}));
       refreshUI();
-    }catch(e){setStatus('⚠ Error al guardar');}
+    }catch(e){
+      pendingOps=ops.concat(pendingOps);
+      setStatus('⚠ Error al guardar: '+(e&&e.message?e.message:'error'));
+    }
   },800);
 }
 
@@ -714,7 +752,7 @@ function showMainPanel(){
   updateRoleBadge();
   document.getElementById('pts-exact').value=state.pts.exact||5;
   document.getElementById('pts-winner').value=state.pts.winner||3;
-  document.getElementById('bin-id-display').textContent=cfg.binId;
+  document.getElementById('bin-id-display').textContent=cfg.binId||BIN_ID;
 }
 
 // ── Helpers ──
@@ -785,7 +823,7 @@ function setKoTeam(mid,side,val){
   if(!state.koTeams)state.koTeams={};
   if(!state.koTeams[mid])state.koTeams[mid]={t1:'Por definir',t2:'Por definir'};
   state.koTeams[mid][side]=val.trim()||'Por definir';
-  saveRemote();
+  queueCloudOp({type:'koTeam',matchId:mid,side,value:state.koTeams[mid][side]});
   renderKnockout();
 }
 
@@ -800,15 +838,15 @@ function setKoPred(mid,side,val){
   if(m&&isPredictionLocked(m)&&!cfg.isAdmin){toast('🔒 Predicciones bloqueadas');renderKnockout();return;}
   if(!state.preds[pl])state.preds[pl]={};
   if(!state.preds[pl][mid])state.preds[pl][mid]={h:'',a:''};
-  state.preds[pl][mid][side]=val===''?'':parseInt(val);
-  saveRemote();
+  state.preds[pl][mid][side]=normalizeScoreValue(val);
+  queueCloudOp({type:'pred',player:pl,matchId:mid,value:{...state.preds[pl][mid]}});
 }
 
 function setKoReal(mid,side,val){
   if(!cfg.isAdmin)return;
   if(!state.real[mid])state.real[mid]={h:'',a:''};
-  state.real[mid][side]=val===''?'':parseInt(val);
-  saveRemote();
+  state.real[mid][side]=normalizeScoreValue(val);
+  queueCloudOp({type:'real',matchId:mid,value:{...state.real[mid]}});
 }
 
 function showTablaMode(mode){
@@ -974,7 +1012,7 @@ function showSection(s,btn){
     // Inicializar koTeams con defaults si están vacíos
     if(!state.koTeams||Object.keys(state.koTeams).length===0){
       state.koTeams={...DEFAULT_KO_TEAMS};
-      saveRemote();
+      queueCloudOp({type:'koTeamsBulk',koTeams:state.koTeams});
     }
     renderKnockout();
   }
@@ -1017,6 +1055,7 @@ function updateRoleBadge(){
 
 // ── Jugadores ──
 function addPlayer(){
+  if(!cfg.isAdmin){toast('Solo el administrador puede agregar jugadores');return;}
   const inp=document.getElementById('new-name');
   const name=inp.value.trim();
   if(!name){toast('Ingresa un nombre');return;}
@@ -1027,7 +1066,7 @@ function addPlayer(){
   local.myPlayers.push(name);
   if(!local.activePlayer){local.activePlayer=name;}
   saveCfg();
-  saveRemote();renderPlayers();inp.value='';toast('✓ '+name+' agregado');
+  queueCloudOp({type:'addPlayer',name});renderPlayers();inp.value='';toast('✓ '+name+' agregado');
 }
 function selectPlayer(n){
   if(!local.myPlayers)local.myPlayers=[];
@@ -1042,11 +1081,12 @@ function selectPlayer(n){
   }
 }
 function removePlayer(n){
-  if(!confirm('¿Eliminar a '+n+'?'))return;
+  if(!cfg.isAdmin){toast('Solo el administrador puede eliminar jugadores');return;}
+  if(!confirm('¿Eliminar a '+n+'? Esta acción borra sus predicciones en la nube.'))return;
   state.players=state.players.filter(p=>p!==n);
   delete state.preds[n];
   if(local.activePlayer===n)local.activePlayer=state.players[0]||null;
-  saveRemote();renderPlayers();toast('Eliminado');
+  queueCloudOp({type:'removePlayer',name:n});renderPlayers();toast('Eliminado');
 }
 function renderPlayers(){
   const el=document.getElementById('player-list');
@@ -1055,8 +1095,8 @@ function renderPlayers(){
   el.innerHTML=state.players.map((p,i)=>{
     const cnt=Object.values(state.preds[p]||{}).filter(x=>x&&x.h!==''&&x.a!=='').length;
     const isA=local.activePlayer===p;const c=colorFor(i);
-    const isMine=true;
-    const lockIcon='';
+    const isMine=cfg.isAdmin || local.myPlayers.includes(p);
+    const lockIcon=!cfg.isAdmin && local.myPlayers.length>0 && !local.myPlayers.includes(p)?' <span class="badge" style="background:#e8f0fe;color:#2E75B6">solo lectura</span>':'';
     return `<div class="card${isA?' card-hl':''}" style="display:flex;align-items:center;gap:10px;cursor:pointer;${!isMine?'opacity:.7':''}" onclick="selectPlayer('${esc(p)}')">
       <div class="avatar" style="background:${rgba(c,0.12)};color:${c}">${initials(p)}</div>
       <div style="flex:1">
@@ -1064,7 +1104,7 @@ function renderPlayers(){
         <div style="font-size:12px;color:#888780;margin-top:2px">${cnt} / ${TOTAL} predicciones</div>
         <div class="pb" style="margin-top:4px"><div class="pf" style="width:${Math.round(cnt/TOTAL*100)}%"></div></div>
       </div>
-      ${isMine||cfg.isAdmin?`<button class="btn" style="font-size:12px;padding:5px 9px;color:#888780" onclick="event.stopPropagation();removePlayer('${esc(p)}')"><i class="ti ti-trash"></i></button>`:''}
+      ${cfg.isAdmin?`<button class="btn" style="font-size:12px;padding:5px 9px;color:#888780" onclick="event.stopPropagation();removePlayer('${esc(p)}')"><i class="ti ti-trash"></i></button>`:''}
     </div>`;
   }).join('');
 }
@@ -1123,16 +1163,16 @@ function setPred(pl,id,side,val){
   if(m&&isPredictionLocked(m)&&!cfg.isAdmin){toast('🔒 Predicciones bloqueadas para este partido');renderPreds();return;}
   if(!state.preds[pl])state.preds[pl]={};
   if(!state.preds[pl][id])state.preds[pl][id]={h:'',a:''};
-  state.preds[pl][id][side]=val===''?'':parseInt(val);
-  saveRemote();updateProg(pl);
+  state.preds[pl][id][side]=normalizeScoreValue(val);
+  queueCloudOp({type:'pred',player:pl,matchId:id,value:{...state.preds[pl][id]}});updateProg(pl);
 }
 
 // ── Resultados reales ──
 function setReal(id,side,val){
   if(!cfg.isAdmin){toast('Solo el admin puede ingresar resultados');return;}
   if(!state.real[id])state.real[id]={h:'',a:''};
-  state.real[id][side]=val===''?'':parseInt(val);
-  saveRemote();
+  state.real[id][side]=normalizeScoreValue(val);
+  queueCloudOp({type:'real',matchId:id,value:{...state.real[id]}});
 }
 function renderRealMatches(){
   document.getElementById('real-group-nav').innerHTML=MG.map(g=>`<button class="gn${local.rg===g.g?' active':''}" onclick="setRealGroup('${g.g}')">${g.g}</button>`).join('');
@@ -1209,19 +1249,24 @@ function renderLeaderboard(scores){
 }
 
 function savePts(){
+  if(!cfg.isAdmin){toast('Solo el administrador puede cambiar los puntos');return;}
   state.pts={exact:parseInt(document.getElementById('pts-exact').value)||5,winner:parseInt(document.getElementById('pts-winner').value)||3};
-  saveRemote();toast('✓ Configuración guardada');
+  queueCloudOp({type:'pts',pts:state.pts});toast('✓ Configuración guardada');
 }
 
 // ── Init ── arrancar directo, sin pantalla de configuración
+if(new URLSearchParams(window.location.search).get('reset')==='1'){
+  localStorage.removeItem(LS_LOCAL);
+  localStorage.removeItem(LS_KEY);
+  history.replaceState(null,'',window.location.pathname);
+}
 loadCfg();
 cfg.isAdmin=cfg.isAdmin||false;
 setStatus('Cargando datos...');
 document.getElementById('setup-panel').style.display='none';
 document.getElementById('main-panel').style.display='block';
 readBin().then(data=>{
-  state=data||state;
-  state.pts=state.pts||{exact:5,winner:3};
+  state=cleanRecord(data||state);
   renderPlayers();
   renderLeaderboard();
   updateRoleBadge();
@@ -1231,7 +1276,7 @@ readBin().then(data=>{
   startSync();
   setStatus('✓ Conectado');
 }).catch(e=>{
-  setStatus('⚠ Sin conexión — usando datos locales');
+  setStatus('⚠ Sin conexión — revisa internet / JSONBin / usa ?reset=1');
   renderPlayers();renderLeaderboard();
 });
 </script>
