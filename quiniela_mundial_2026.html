@@ -721,7 +721,7 @@ async function saveRemote(){
           if(cfg.isAdmin){merged.real={...(remote.real||{}),...state.real};}
           else{merged.real=remote.real||state.real;}
           merged.pts=state.pts;
-          merged.koTeams=mergeKoTeams(remote.koTeams,state.koTeams);
+          merged.koTeams = mergeKoTeams({...DEFAULT_KO_TEAMS, ...(remote.koTeams||{})}, state.koTeams||{});
           toSave=merged;
           // IMPORTANTE: NO reemplazar state.preds local con merged.
           // Solo actualizar players, real y koTeams (que el usuario no edita char por char).
