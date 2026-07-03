@@ -392,10 +392,10 @@ const KO_MATCHES = [
   // Octavos de Final
   {id:'ko17',phase:'Octavos de Final',date:'5 jul',time:'16:00'},
   {id:'ko18',phase:'Octavos de Final',date:'4 jul',time:'17:00'},
-  {id:'ko19',phase:'Octavos de Final',date:'6 jul',time:'14:00'},
+  {id:'ko19',phase:'Octavos de Final',date:'6 jul',time:'15:00'},
   {id:'ko20',phase:'Octavos de Final',date:'4 jul',time:'13:00'},
   {id:'ko21',phase:'Octavos de Final',date:'5 jul',time:'20:00'},
-  {id:'ko22',phase:'Octavos de Final',date:'6 jul',time:'17:00'},
+  {id:'ko22',phase:'Octavos de Final',date:'6 jul',time:'20:00'},
   {id:'ko23',phase:'Octavos de Final',date:'7 jul',time:'12:00'},
   {id:'ko24',phase:'Octavos de Final',date:'7 jul',time:'16:00'},
   // Cuartos de Final
@@ -439,6 +439,35 @@ const DEFAULT_KO_TEAMS = {
   ko23:{t1:'Por definir',t2:'Por definir'},
   ko24:{t1:'Por definir',t2:'Por definir'},
 };
+
+// Resuelve el equipo de un partido KO: si el guardado dice "Por definir" pero
+// el DEFAULT tiene un equipo real (ya definido por resultados), usa el DEFAULT.
+function resolveKoTeams(mid){
+  const saved=(state.koTeams&&state.koTeams[mid])||{};
+  const def=DEFAULT_KO_TEAMS[mid]||{t1:'Por definir',t2:'Por definir'};
+  const pick=(s,d)=>{
+    if(s&&s!=='Por definir')return s;      // el guardado tiene equipo real
+    if(d&&d!=='Por definir')return d;       // si no, usar el default real
+    return 'Por definir';
+  };
+  return {t1:pick(saved.t1,def.t1),t2:pick(saved.t2,def.t2)};
+}
+
+// Fusiona koTeams priorizando equipos reales sobre "Por definir"
+function mergeKoTeams(remoteKT, localKT){
+  const out={};
+  const allIds=new Set([...Object.keys(DEFAULT_KO_TEAMS),...Object.keys(remoteKT||{}),...Object.keys(localKT||{})]);
+  allIds.forEach(mid=>{
+    const d=DEFAULT_KO_TEAMS[mid]||{t1:'Por definir',t2:'Por definir'};
+    const r=(remoteKT&&remoteKT[mid])||{};
+    const l=(localKT&&localKT[mid])||{};
+    const pick=(...vals)=>{ for(const v of vals){ if(v&&v!=='Por definir')return v; } return 'Por definir'; };
+    // Prioridad: local real > remoto real > default real
+    out[mid]={t1:pick(l.t1,r.t1,d.t1),t2:pick(l.t2,r.t2,d.t2)};
+  });
+  return out;
+}
+
 
 
 
@@ -628,7 +657,7 @@ async function syncNow(){
           // Merge koTeams: remoto primero, luego local (local gana)
     const remoteKT=remote.koTeams||{};
     const localKT=state.koTeams||{};
-    merged.koTeams={...DEFAULT_KO_TEAMS,...remoteKT,...localKT};
+    merged.koTeams=mergeKoTeams(remoteKT,localKT);
     // Preservar TODAS las predicciones locales (no solo del jugador activo)
     Object.keys(state.preds).forEach(p=>{
       if(state.preds[p]&&Object.keys(state.preds[p]).length>0){
@@ -692,7 +721,7 @@ async function saveRemote(){
           if(cfg.isAdmin){merged.real={...(remote.real||{}),...state.real};}
           else{merged.real=remote.real||state.real;}
           merged.pts=state.pts;
-          merged.koTeams={...DEFAULT_KO_TEAMS,...(remote.koTeams||{}),...(state.koTeams||{})};
+          merged.koTeams = mergeKoTeams({...DEFAULT_KO_TEAMS, ...(remote.koTeams||{})}, state.koTeams||{});
           toSave=merged;
           // IMPORTANTE: NO reemplazar state.preds local con merged.
           // Solo actualizar players, real y koTeams (que el usuario no edita char por char).
@@ -765,7 +794,7 @@ function renderKnockout(){
   let lastPhase='';
   
   el.innerHTML=KO_MATCHES.map(m=>{
-    const teams=kt[m.id]||DEFAULT_KO_TEAMS[m.id]||{t1:'Por definir',t2:'Por definir'};
+    const teams=resolveKoTeams(m.id);
     const t1=teams.t1||'Por definir';
     const t2=teams.t2||'Por definir';
     const defined=t1!=='Por definir'&&t2!=='Por definir';
@@ -911,7 +940,7 @@ function renderKoRealMatches(){
   if(adminBadge&&cfg.isAdmin)adminBadge.style.display='';
   let lastPhase='';
   el.innerHTML=KO_MATCHES.map(m=>{
-    const teams=kt[m.id]||DEFAULT_KO_TEAMS[m.id]||{t1:'Por definir',t2:'Por definir'};
+    const teams=resolveKoTeams(m.id);
     const t1=teams.t1||'Por definir';
     const t2=teams.t2||'Por definir';
     const defined=t1!=='Por definir'&&t2!=='Por definir';
@@ -953,7 +982,7 @@ function renderPredKo(){
   let lastPhase='';
   
   el.innerHTML=KO_MATCHES.map(m=>{
-    const teams=kt[m.id]||DEFAULT_KO_TEAMS[m.id]||{t1:'Por definir',t2:'Por definir'};
+    const teams=resolveKoTeams(m.id);
     const t1=teams.t1||'Por definir';
     const t2=teams.t2||'Por definir';
     const defined=t1!=='Por definir'&&t2!=='Por definir';
